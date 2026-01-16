@@ -2,7 +2,7 @@
 #include <algorithm>
 #include <string>
 #include <cctype>
-#include <VFS.h> // for logging
+#include <kodi/addon-instance/VFS.h> // for logging
 #include <kodi/General.h>
 #include <mutex>
 #include <thread>
