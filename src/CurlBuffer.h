@@ -78,6 +78,12 @@ protected:
 
     // 内部辅助
     void SetupCurlOptions(CURL *curl, bool headOnly, int64_t startPos = 0);
+    
+    // [新增] 原始指针写入回调 (用于多线程并发写入)
+    static size_t RawWriteCallback(void *contents, size_t size, size_t nmemb, void *userp);
+    
+    // [新增] 块下载函数 (写入原始指针)
+    bool DownloadChunk(CURL* curl, int64_t start, int64_t length, uint8_t* dest);
 
 private:
     // 基础信息
