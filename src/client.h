@@ -8,7 +8,7 @@
 // ---------------------------------------------------------------------------
 // 负责实现 Kodi 的 VFS 接口，并将请求转发给我们自己的缓存核心 (CCurlBuffer)
 // ---------------------------------------------------------------------------
-class CClientVFS : public kodi::addon::CInstanceVFS
+class __attribute__((visibility("default"))) CClientVFS : public kodi::addon::CInstanceVFS
 {
 public:
   CClientVFS(const kodi::addon::IInstanceInfo& instance);
@@ -42,7 +42,7 @@ public:
 // ---------------------------------------------------------------------------
 // 工厂类
 // ---------------------------------------------------------------------------
-class CMyAddon : public kodi::addon::CAddonBase
+class __attribute__((visibility("default"))) CMyAddon : public kodi::addon::CAddonBase
 {
 public:
   CMyAddon() = default;
