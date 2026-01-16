@@ -6,10 +6,11 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <memory>  // Add memory header for smart pointers
 #include <curl/curl.h>
 #include <kodi/addon-instance/VFS.h>
 
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- 
 // CCurlBuffer: 核心预读引擎
 // ---------------------------------------------------------------------------
 class CCurlBuffer
@@ -107,13 +108,13 @@ private:
 
     // 线程
     std::thread m_worker_thread;
-    // CURL *curl_handle = nullptr; // Removed: use pool directly
+    std::atomic<bool> m_worker_thread_joined{false}; // Track if thread has been joined
 
     // 缓存策略区
     // 150MB Ring Buffer + 30MB Head + 30MB Tail (Shadow)
 
     // 1. 环形主缓存
-    std::vector<uint8_t> ring_buffer;
+    std::unique_ptr<std::vector<uint8_t>> ring_buffer;
     size_t m_ring_buffer_size = 0; // 150MB
     size_t m_ring_buffer_head = 0;
     size_t m_ring_buffer_tail = 0;
@@ -130,7 +131,11 @@ private:
     std::shared_ptr<std::vector<uint8_t>> m_middle_buffer;
     int64_t m_middle_valid_from = -1; // -1 无效
     bool CreateMiddleCache(int64_t start_pos);
-    std::mutex m_ring_buffer_mutex;
+    mutable std::mutex m_ring_buffer_mutex; // Make mutex mutable for const methods
     std::condition_variable m_cv_reader; // 读者等数据
     std::condition_variable m_cv_writer; // 写者等空间
 };
+
+// Export C interface functions for cleanup
+extern "C" void CleanupCurlPool();
+extern "C" void CleanupGlobalCaches();

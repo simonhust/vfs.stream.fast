@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <map>
+#include <unordered_map>
 
 // 定义一些常量
 static const int MAX_RETRIES = 10;
@@ -56,7 +57,7 @@ struct StatCacheEntry
 };
 
 // Key: URL (normalized), Value: StatCacheEntry
-static std::map<std::string, StatCacheEntry> g_stat_cache;
+static std::unordered_map<std::string, StatCacheEntry> g_stat_cache;  // Changed to unordered_map for better performance
 static std::mutex g_stat_cache_mutex;
 
 // -----------------------------------------------------------------------------------------
@@ -64,7 +65,7 @@ static std::mutex g_stat_cache_mutex;
 // -----------------------------------------------------------------------------------------
 // 缓存 302 跳转后的有效 URL，下次直接访问目标地址
 // Key: Original URL, Value: Final Effective URL
-static std::map<std::string, std::string> g_redirect_cache;
+static std::unordered_map<std::string, std::string> g_redirect_cache;  // Changed to unordered_map for better performance
 static std::mutex g_redirect_cache_mutex;
 // -----------------------------------------------------------------------------------------
 
@@ -228,6 +229,42 @@ static void ReturnCurlHandleToPool(CURL* handle)
     }
 }
 
+// Cleanup function to be called when addon shuts down
+static void CleanupCurlPool()
+{
+    std::lock_guard<std::mutex> lock(g_curl_pool_mutex);
+    for (auto* handle : g_curl_handle_pool) {
+        if (handle) {
+            curl_easy_cleanup(handle);
+        }
+    }
+    g_curl_handle_pool.clear();
+}
+
+// Cleanup function for global caches
+static void CleanupGlobalCaches()
+{
+    // Clean up data cache
+    {
+        std::lock_guard<std::mutex> lock(g_data_cache_mutex);
+        g_data_cache.head_buffer.reset();
+        g_data_cache.tail_buffer.reset();
+        g_data_cache.middle_buffer.reset();
+    }
+    
+    // Clean up stat cache
+    {
+        std::lock_guard<std::mutex> lock(g_stat_cache_mutex);
+        g_stat_cache.clear();
+    }
+    
+    // Clean up redirect cache
+    {
+        std::lock_guard<std::mutex> lock(g_redirect_cache_mutex);
+        g_redirect_cache.clear();
+    }
+}
+
 
 
 // -----------------------------------------------------------------------------------------
@@ -261,6 +298,11 @@ CCurlBuffer::CCurlBuffer()
 {
     // 初始化复用的 Curl 对象
     // curl_handle = GetCurlHandleFromPool();
+    m_ring_buffer_size = m_cfg_ring_size;
+    ring_buffer = std::make_unique<std::vector<uint8_t>>(m_ring_buffer_size);
+    m_ring_buffer_head = 0;
+    m_ring_buffer_tail = 0;
+    m_rb_bytes_available = 0;
 }
 
 CCurlBuffer::~CCurlBuffer()
@@ -277,18 +319,41 @@ CCurlBuffer::~CCurlBuffer()
 void CCurlBuffer::Close()
 {
     kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 调用 Close(), 当前逻辑位置=%lld", m_logical_position);
+    
     // 1. 停止标志
     m_is_running = false;
-
+    m_abort_transfer = true; // Also abort transfer
+    
     // 2. 唤醒所有可能在此等待的线程
-    m_cv_reader.notify_all();
-    m_cv_writer.notify_all();
-
-    // 3. 等待工作线程结束
-    if (m_worker_thread.joinable())
     {
-        m_worker_thread.join();
+        std::lock_guard<std::mutex> lock(m_ring_buffer_mutex);
+        m_cv_reader.notify_all();
+        m_cv_writer.notify_all();
     }
+
+    // 3. 等待工作线程结束 - only join if not already joined
+    if (m_worker_thread.joinable() && !m_worker_thread_joined.load()) {
+        m_worker_thread.join();
+        m_worker_thread_joined = true;
+    }
+    
+    // 4. Clear buffers to free memory
+    ring_buffer.reset();
+    m_head_buffer.reset();
+    m_tail_buffer.reset();
+    m_middle_buffer.reset();
+    
+    // 5. Reset state variables
+    m_rb_bytes_available = 0;
+    m_ring_buffer_head = 0;
+    m_ring_buffer_tail = 0;
+    m_head_valid_length = 0;
+    m_tail_valid_from = -1;
+    m_middle_valid_from = -1;
+    m_is_eof = false;
+    m_has_error = false;
+    m_download_position = 0;
+    m_logical_position = 0;
 }
 
 bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)

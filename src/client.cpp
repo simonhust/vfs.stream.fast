@@ -1,9 +1,13 @@
 #include "client.h"
 
+// Forward declarations for cleanup functions
+extern "C" void CleanupCurlPool(); // Defined in CurlBuffer.cpp
+extern "C" void CleanupGlobalCaches(); // Defined in CurlBuffer.cpp
+
 // 导出标准 C 接口
 ADDONCREATOR(CMyAddon)
 
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------  
 // 实现
 // ---------------------------------------------------------------------------
 
@@ -11,6 +15,14 @@ CClientVFS::CClientVFS(const kodi::addon::IInstanceInfo &instance)
     : kodi::addon::CInstanceVFS(instance)
 {
     kodi::Log(ADDON_LOG_INFO, "Fast Stream VFS: Loaded");
+}
+
+CClientVFS::~CClientVFS()
+{
+    kodi::Log(ADDON_LOG_INFO, "Fast Stream VFS: Unloaded");
+    // Cleanup curl handles and global caches when addon is destroyed
+    CleanupCurlPool();
+    CleanupGlobalCaches();
 }
 
 ADDON_STATUS CMyAddon::CreateInstance(const kodi::addon::IInstanceInfo &instance,
