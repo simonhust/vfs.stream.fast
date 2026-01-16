@@ -2,7 +2,7 @@ name: Build VFS Addon
 
 on:
   push:
-    branches: [ "beta" ]
+    branches: [ "qwen-code-161ee775-1d83-4608-bd96-537d28af1f6b" ]
   workflow_dispatch:
 
 jobs:
