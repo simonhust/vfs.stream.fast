@@ -104,10 +104,18 @@ struct LRUBlockCache
 
     size_t InvalidateUrlVersion(const std::string& url, time_t mod_time)
     {
+        // Only evict blocks when we have a reliable new mod_time AND the cached
+        // blocks also carry a reliable (non-zero) mod_time that genuinely differs.
+        // CDN edge servers (after 302 to signed URLs) often return inconsistent or
+        // absent Last-Modified headers; without this guard, a throwaway Stat() call
+        // would wipe the LRU cache of the active/deferred-close playback session.
+        if (mod_time == 0)
+            return 0;
+
         size_t removed = 0;
         for (auto it = lru_order.begin(); it != lru_order.end();)
         {
-            if (it->url == url && it->mod_time != mod_time)
+            if (it->url == url && it->mod_time > 0 && it->mod_time != mod_time)
             {
                 blocks.erase(*it);
                 it = lru_order.erase(it);
