@@ -2447,9 +2447,9 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         }
 
         // ---------------------------------------------------------
-        // ISO 首读优化: 批量预取首尾区域到 LRU (libbluray 需要读 UDF 文件系统表)
+        // ISO 首读优化: 2 线程并行预取首尾区域到 LRU
         // ---------------------------------------------------------
-        // 仅发 2 次大 Range 请求 (头100MB + 尾30MB), 避免大量小请求触发网盘风控。
+        // 2 个线程分别下载头 100MB 和尾 30MB, 各只用 1 次大 Range 请求。
         // 返回数据按 LRU_BLOCK_SIZE 切块后写入 LRU 缓存。
         if (m_is_first_read && m_is_iso && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
         {
@@ -2462,57 +2462,69 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             int64_t tail_start = std::max(head_len, m_total_size - PREFETCH_TAIL);
             int64_t tail_len = m_total_size - tail_start;
 
-            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首读批量预取: 头 %lldMB + 尾 %lldMB",
+            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首读并行预取: 头 %lldMB + 尾 %lldMB (2 线程)",
                 (long long)head_len >> 20, (long long)tail_len >> 20);
 
-            // 用一个独立的 CURL handle 下载头部区域
-            CURL* prefetch_curl = GetCurlHandleFromPool();
-            if (prefetch_curl)
-            {
-                std::vector<uint8_t> head_data((size_t)head_len);
-                if (DownloadRange(prefetch_curl, 0, head_len, head_data) && !head_data.empty())
-                {
-                    int64_t head_blocks = (head_len + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE;
-                    for (int64_t bn = 0; bn < head_blocks; bn++)
-                    {
-                        int64_t offset = bn * (int64_t)LRU_BLOCK_SIZE;
-                        int64_t block_size = std::min((int64_t)LRU_BLOCK_SIZE, head_len - offset);
-                        if (block_size <= 0) break;
-                        std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                        g_lru_cache.Put(m_file_url, m_mod_time, bn,
-                            head_data.data() + offset, (size_t)block_size);
-                    }
-                }
-                ReturnCurlHandleToPool(prefetch_curl);
-            }
+            std::atomic<bool> head_ok{false}, tail_ok{false};
+            std::vector<uint8_t> head_data, tail_data;
 
-            // 用另一个 CURL handle 下载尾部区域
-            if (tail_len > 0)
+            // 线程 1: 下载头部
+            std::thread head_thread([this, head_len, &head_data, &head_ok]() {
+                CURL* curl = GetCurlHandleFromPool();
+                if (!curl) return;
+                head_data.resize((size_t)head_len);
+                head_ok = DownloadRange(curl, 0, head_len, head_data) && !head_data.empty();
+                ReturnCurlHandleToPool(curl);
+            });
+
+            // 线程 2: 下载尾部
+            std::thread tail_thread([this, tail_start, tail_len, &tail_data, &tail_ok]() {
+                if (tail_len <= 0) return;
+                CURL* curl = GetCurlHandleFromPool();
+                if (!curl) return;
+                tail_data.resize((size_t)tail_len);
+                tail_ok = DownloadRange(curl, tail_start, tail_len, tail_data) && !tail_data.empty();
+                ReturnCurlHandleToPool(curl);
+            });
+
+            // 等待两个线程完成
+            head_thread.join();
+            tail_thread.join();
+
+            // 头部数据写入 LRU
+            if (head_ok)
             {
-                CURL* tail_curl = GetCurlHandleFromPool();
-                if (tail_curl)
+                int64_t head_blocks = (head_len + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE;
+                for (int64_t bn = 0; bn < head_blocks; bn++)
                 {
-                    int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
-                    std::vector<uint8_t> tail_data((size_t)tail_len);
-                    if (DownloadRange(tail_curl, tail_start, tail_len, tail_data) && !tail_data.empty())
-                    {
-                        int64_t tail_blocks = (tail_len + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE;
-                        for (int64_t i = 0; i < tail_blocks; i++)
-                        {
-                            int64_t bn = last_block_num - tail_blocks + 1 + i;
-                            int64_t offset = i * (int64_t)LRU_BLOCK_SIZE;
-                            int64_t block_size = std::min((int64_t)LRU_BLOCK_SIZE, tail_len - offset);
-                            if (block_size <= 0) break;
-                            std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                            g_lru_cache.Put(m_file_url, m_mod_time, bn,
-                                tail_data.data() + offset, (size_t)block_size);
-                        }
-                    }
-                    ReturnCurlHandleToPool(tail_curl);
+                    int64_t offset = bn * (int64_t)LRU_BLOCK_SIZE;
+                    int64_t block_size = std::min((int64_t)LRU_BLOCK_SIZE, head_len - offset);
+                    if (block_size <= 0) break;
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, m_mod_time, bn,
+                        head_data.data() + offset, (size_t)block_size);
                 }
             }
 
-            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首尾批量预取完成");
+            // 尾部数据写入 LRU
+            if (tail_ok)
+            {
+                int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
+                int64_t tail_blocks = (tail_len + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE;
+                for (int64_t i = 0; i < tail_blocks; i++)
+                {
+                    int64_t bn = last_block_num - tail_blocks + 1 + i;
+                    int64_t offset = i * (int64_t)LRU_BLOCK_SIZE;
+                    int64_t block_size = std::min((int64_t)LRU_BLOCK_SIZE, tail_len - offset);
+                    if (block_size <= 0) break;
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, m_mod_time, bn,
+                        tail_data.data() + offset, (size_t)block_size);
+                }
+            }
+
+            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首尾并行预取完成 (头%s + 尾%s)",
+                head_ok ? "OK" : "FAIL", tail_ok ? "OK" : "FAIL");
         }
 
         // 计算目标块的绝对范围
