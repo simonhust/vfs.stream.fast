@@ -2456,7 +2456,7 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
             m_is_first_read = false;
 
             static constexpr int64_t PREFETCH_HEAD = 5 * 1024 * 1024;
-            static constexpr int64_t PREFETCH_TAIL = 33 * 1024 * 1024;
+            static constexpr int64_t PREFETCH_TAIL = 5 * 1024 * 1024;
 
             int64_t head_len = std::min(PREFETCH_HEAD, m_total_size);
             int64_t tail_start = std::max(head_len, m_total_size - PREFETCH_TAIL);
