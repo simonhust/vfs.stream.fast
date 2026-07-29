@@ -31,9 +31,9 @@
                 </setting>
                 <setting id="lru_total_size" type="integer" label="30012">
                     <level>0</level>
-                    <default>50</default>
+                    <default>200</default>
                     <constraints>
-                        <minimum>40</minimum>
+                        <minimum>100</minimum>
                         <maximum>1024</maximum>
                         <step>10</step>
                     </constraints>

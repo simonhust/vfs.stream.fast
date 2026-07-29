@@ -28,7 +28,7 @@
 #include "tinyxml2.h"
 
 size_t CCurlBuffer::LRU_BLOCK_SIZE = 1 * 1024 * 1024;
-size_t CCurlBuffer::LRU_TOTAL_SIZE = 100 * 1024 * 1024;
+size_t CCurlBuffer::LRU_TOTAL_SIZE = 200 * 1024 * 1024;
 size_t CCurlBuffer::LRU_MAX_BLOCKS = CCurlBuffer::LRU_TOTAL_SIZE / CCurlBuffer::LRU_BLOCK_SIZE;
 
 // -----------------------------------------------------------------------------------------
@@ -2447,52 +2447,79 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         }
 
         // ---------------------------------------------------------
-        // ISO 首读优化: 预取文件尾块 (libbluray 需要读 UDF 文件系统表)
+        // ISO 首读优化: 同步预取首尾区域到 LRU (libbluray 需要读 UDF 文件系统表)
         // ---------------------------------------------------------
-        // Worker 刚启动正在下载头部, 这里趁机用 DownloadRange 下载尾块。
-        // 先查 LRU, miss 才下载。两个下载并行执行, 省去后续瞬移耗时。
+        // 首 100MB 覆盖 VRS/AVDP/VDS/FSD/目录项/BDMV 结构,
+        // 尾 30MB 覆盖备份 AVDP 和文件系统元数据。
+        // 全部预取完毕后才继续 Read(), 确保 libbluray 的随机访问命中 LRU,
+        // 避免 Worker 刚启动就反复瞬移。
         if (m_is_first_read && m_is_iso && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
         {
             m_is_first_read = false;
 
             int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
-            if (last_block_num != block_num) // 尾块 != 当前块
+
+            // 预取范围: 首 100MB, 尾 30MB
+            static constexpr int64_t PREFETCH_HEAD_BYTES = 100 * 1024 * 1024;
+            static constexpr int64_t PREFETCH_TAIL_BYTES = 30 * 1024 * 1024;
+
+            int64_t head_blocks = std::min(last_block_num + 1,
+                PREFETCH_HEAD_BYTES / (int64_t)LRU_BLOCK_SIZE + 1);
+            int64_t tail_blocks = std::min(last_block_num + 1,
+                PREFETCH_TAIL_BYTES / (int64_t)LRU_BLOCK_SIZE + 1);
+
+            // 收集需要预取的块 (头块 + 尾块, 去重)
+            std::vector<int64_t> to_prefetch;
+            for (int64_t i = 0; i < head_blocks && i <= last_block_num; i++)
+                to_prefetch.push_back(i);
+            for (int64_t i = std::max(head_blocks, last_block_num - tail_blocks + 1);
+                 i <= last_block_num; i++)
+                to_prefetch.push_back(i);
+
+            // 去重并排序
+            std::sort(to_prefetch.begin(), to_prefetch.end());
+            to_prefetch.erase(std::unique(to_prefetch.begin(), to_prefetch.end()), to_prefetch.end());
+
+            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首读预取 %zu blocks (头 %lldMB + 尾 %lldMB, 共 %lldMB)",
+                to_prefetch.size(),
+                (long long)PREFETCH_HEAD_BYTES >> 20,
+                (long long)PREFETCH_TAIL_BYTES >> 20,
+                (long long)((int64_t)to_prefetch.size() * (int64_t)LRU_BLOCK_SIZE) >> 20);
+
+            // 顺序下载缺失块到 LRU
+            int prefetch_count = 0;
+            for (int64_t bn : to_prefetch)
             {
-                std::shared_ptr<std::vector<uint8_t>> tail_cached;
                 {
                     std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                    tail_cached = g_lru_cache.Get(m_file_url, m_mod_time, last_block_num);
+                    if (g_lru_cache.Get(m_file_url, m_mod_time, bn))
+                    {
+                        prefetch_count++;
+                        continue;
+                    }
                 }
-                if (!tail_cached)
+
+                int64_t start = bn * (int64_t)LRU_BLOCK_SIZE;
+                int64_t size = (bn == last_block_num) ? (m_total_size - start) : (int64_t)LRU_BLOCK_SIZE;
+
+                kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 首读预取: Block#%lld (pos %lld, size %lld)",
+                    bn, start, size);
+
+                CURL* dl_curl = GetCurlHandleFromPool();
+                std::vector<uint8_t> data((size_t)size);
+                bool ok = DownloadRange(dl_curl, start, size, data);
+                ReturnCurlHandleToPool(dl_curl);
+
+                if (ok && !data.empty())
                 {
-                    int64_t last_block_start = last_block_num * (int64_t)LRU_BLOCK_SIZE;
-                    int64_t last_block_size = m_total_size - last_block_start;
-
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 首读预取尾块: Block#%lld (pos %lld, size %lld)",
-                        last_block_num, last_block_start, last_block_size);
-
-                    std::vector<uint8_t> tail_data((size_t)last_block_size);
-                    CURL* dl_curl = GetCurlHandleFromPool();
-                    bool ok = DownloadRange(dl_curl, last_block_start, last_block_size, tail_data);
-                    ReturnCurlHandleToPool(dl_curl);
-
-                    if (ok && !tail_data.empty())
-                    {
-                        std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                        g_lru_cache.Put(m_file_url, m_mod_time, last_block_num, tail_data.data(), tail_data.size());
-                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 尾块预取成功, 写入 LRU Block#%lld (%zu bytes)",
-                            last_block_num, tail_data.size());
-                    }
-                    else
-                    {
-                        kodi::Log(ADDON_LOG_WARNING, "FastVFS: ISO 尾块预取失败, 将在后续按需下载");
-                    }
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, m_mod_time, bn, data.data(), data.size());
+                    prefetch_count++;
                 }
             }
-        }
-        else
-        {
-            m_is_first_read = false;
+
+            kodi::Log(ADDON_LOG_INFO, "FastVFS: ★ ISO 首尾块预取完成: %d/%zu blocks in LRU",
+                prefetch_count, to_prefetch.size());
         }
 
         // 计算目标块的绝对范围
