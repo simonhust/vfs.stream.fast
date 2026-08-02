@@ -2141,15 +2141,15 @@ void CCurlBuffer::SetupBaseCurlOptions(CURL* curl, const std::string& target_url
     {
         // Map Kodi proxy type index to CURL proxy type constant
         // Kodi settings.xml 选项顺序: 0=HTTP, 1=SOCKS4, 2=SOCKS4A, 3=SOCKS5, 4=SOCKS5H(hostname)
-        curl_proxytype curl_ptype = CURLPROXY_HTTP;
+        curl_proxytype curl_ptype = static_cast<curl_proxytype>(CURLPROXY_HTTP);
         switch (m_proxy_type)
         {
-            case 0: curl_ptype = CURLPROXY_HTTP;           break;
-            case 1: curl_ptype = CURLPROXY_SOCKS4;         break;
-            case 2: curl_ptype = CURLPROXY_SOCKS4A;        break;
-            case 3: curl_ptype = CURLPROXY_SOCKS5;         break;
-            case 4: curl_ptype = CURLPROXY_SOCKS5_HOSTNAME;break;
-            default: curl_ptype = CURLPROXY_HTTP;          break;
+            case 0: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_HTTP);           break;
+            case 1: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_SOCKS4);         break;
+            case 2: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_SOCKS4A);        break;
+            case 3: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_SOCKS5);         break;
+            case 4: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_SOCKS5_HOSTNAME);break;
+            default: curl_ptype = static_cast<curl_proxytype>(CURLPROXY_HTTP);          break;
         }
         curl_easy_setopt(curl, CURLOPT_PROXYTYPE, (long)curl_ptype);
         curl_easy_setopt(curl, CURLOPT_PROXY, m_proxy_server.c_str());
