@@ -2447,53 +2447,95 @@ ssize_t CCurlBuffer::Read(uint8_t *buffer, size_t size)
         }
 
         // ---------------------------------------------------------
-        // ISO 首读优化: 预取文件尾块 (libbluray 需要读 UDF 文件系统表)
+        // 首读优化: 预取文件尾块
         // ---------------------------------------------------------
-        // Worker 刚启动正在下载头部, 这里趁机用 DownloadRange 下载尾块。
-        // 先查 LRU, miss 才下载。两个下载并行执行, 省去后续瞬移耗时。
-        if (m_is_first_read && m_is_iso && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
+        // ISO: libbluray 需要读 UDF 文件系统表（尾块）
+        // MP4/视频: moov 元数据通常在文件末尾，预取尾部可避免 seek 卡死
+        // Worker 刚启动正在下载头部, 这里趁机用 DownloadRange 并行下载尾块。
+        if (m_is_first_read && m_support_range && m_total_size > (int64_t)LRU_BLOCK_SIZE)
         {
             m_is_first_read = false;
 
-            int64_t last_block_num = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
-            if (last_block_num != block_num) // 尾块 != 当前块
+            int64_t prefetch_start = 0;
+            int64_t prefetch_size = 0;
+
+            if (m_is_iso)
             {
-                std::shared_ptr<std::vector<uint8_t>> tail_cached;
+                // ISO: 只需最后一个块 (UDF anchor)
+                int64_t last_block = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
+                if (last_block == block_num) goto skip_prefetch;
+                prefetch_start = last_block * (int64_t)LRU_BLOCK_SIZE;
+                prefetch_size = m_total_size - prefetch_start;
+            }
+            else if (m_is_video)
+            {
+                // 视频 (MP4/MKV): 预取尾部 10MB (覆盖 moov 区域)
+                int64_t tail_size = std::min((int64_t)(10 * 1024 * 1024), m_total_size);
+                // 只预取尾部 10MB 的起始块 (如果当前正在读第一块, 跳过起始块)
+                int64_t tail_start_block = (m_total_size - tail_size) / (int64_t)LRU_BLOCK_SIZE;
+                int64_t first_block = 0;
+                if (tail_start_block <= first_block) goto skip_prefetch;
+                prefetch_start = tail_start_block * (int64_t)LRU_BLOCK_SIZE;
+                prefetch_size = m_total_size - prefetch_start;
+            }
+
+            if (prefetch_size > 0)
+            {
+                // 检查 LRU 是否已有缓存
+                bool already_cached = true;
+                int64_t check_block = prefetch_start / (int64_t)LRU_BLOCK_SIZE;
+                int64_t end_block = (m_total_size - 1) / (int64_t)LRU_BLOCK_SIZE;
                 {
                     std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                    tail_cached = g_lru_cache.Get(m_file_url, m_mod_time, last_block_num);
+                    for (int64_t b = check_block; b <= end_block; b++)
+                    {
+                        if (!g_lru_cache.Get(m_file_url, m_mod_time, b))
+                        {
+                            already_cached = false;
+                            break;
+                        }
+                    }
                 }
-                if (!tail_cached)
+
+                if (!already_cached)
                 {
-                    int64_t last_block_start = last_block_num * (int64_t)LRU_BLOCK_SIZE;
-                    int64_t last_block_size = m_total_size - last_block_start;
+                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ 首读预取尾部: %s, pos %lld, size %lld",
+                        m_is_iso ? "ISO" : "Video", prefetch_start, prefetch_size);
 
-                    kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 首读预取尾块: Block#%lld (pos %lld, size %lld)",
-                        last_block_num, last_block_start, last_block_size);
-
-                    std::vector<uint8_t> tail_data((size_t)last_block_size);
+                    std::vector<uint8_t> tail_data((size_t)prefetch_size);
                     CURL* dl_curl = GetCurlHandleFromPool();
-                    bool ok = DownloadRange(dl_curl, last_block_start, last_block_size, tail_data);
+                    bool ok = DownloadRange(dl_curl, prefetch_start, prefetch_size, tail_data);
                     ReturnCurlHandleToPool(dl_curl);
 
                     if (ok && !tail_data.empty())
                     {
-                        std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
-                        g_lru_cache.Put(m_file_url, m_mod_time, last_block_num, tail_data.data(), tail_data.size());
-                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ ISO 尾块预取成功, 写入 LRU Block#%lld (%zu bytes)",
-                            last_block_num, tail_data.size());
+                        int64_t num_blocks = (prefetch_size + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE;
+                        {
+                            std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                            for (int64_t i = 0; i < num_blocks; i++)
+                            {
+                                int64_t block_start = i * (int64_t)LRU_BLOCK_SIZE;
+                                int64_t block_size = std::min((int64_t)LRU_BLOCK_SIZE, (int64_t)prefetch_size - block_start);
+                                if (block_size > 0)
+                                {
+                                    int64_t abs_block_num = (prefetch_start / (int64_t)LRU_BLOCK_SIZE) + i;
+                                    g_lru_cache.Put(m_file_url, m_mod_time, abs_block_num,
+                                        tail_data.data() + block_start, (size_t)block_size);
+                                }
+                            }
+                        }
+                        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ★ 尾部预取成功, 写入 %lld 个 LRU 块 (%zu bytes)",
+                            (long long)((prefetch_size + (int64_t)LRU_BLOCK_SIZE - 1) / (int64_t)LRU_BLOCK_SIZE), tail_data.size());
                     }
                     else
                     {
-                        kodi::Log(ADDON_LOG_WARNING, "FastVFS: ISO 尾块预取失败, 将在后续按需下载");
+                        kodi::Log(ADDON_LOG_WARNING, "FastVFS: 尾部预取失败, 将在后续按需下载");
                     }
                 }
             }
         }
-        else
-        {
-            m_is_first_read = false;
-        }
+        skip_prefetch:
+        ;
 
         // 计算目标块的绝对范围
         int64_t block_start = block_num * (int64_t)LRU_BLOCK_SIZE;
