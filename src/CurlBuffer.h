@@ -52,6 +52,7 @@ public:
 
     // ISO 延迟关闭支持
     bool IsIsoFile() const { return m_is_iso; }
+    bool IsVideoFile() const { return m_is_video; }
     const std::string& GetOriginalUrl() const { return m_original_kodi_url; }
     void ResetForReuse(); // 延迟关闭复用时重置逻辑状态
 

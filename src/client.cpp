@@ -263,8 +263,8 @@ bool CClientVFS::Close(kodi::addon::VFSFileHandle context)
     if (!file)
         return false;
 
-    // ----- ISO 延迟关闭: 保持 Worker 运行, 等待短时间内复用 -----
-    if (file->IsIsoFile() && file->IsRangeSupported())
+    // ----- ISO/视频延迟关闭: 保持 Worker 运行, 等待短时间内复用 -----
+    if ((file->IsIsoFile() || file->IsVideoFile()) && file->IsRangeSupported())
     {
         std::lock_guard<std::mutex> lock(g_cache_mutex);
         EnsureCleanupThread();
@@ -285,7 +285,7 @@ bool CClientVFS::Close(kodi::addon::VFSFileHandle context)
         g_cache[urlKey] = {file, expire_at};
         g_cache_cv.notify_one(); // 唤醒清理线程重新计算到期时间
 
-        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: ISO 延迟关闭 (宽限 %dms). URL: %s",
+        kodi::Log(ADDON_LOG_DEBUG, "FastVFS: 视频延迟关闭 (宽限 %dms). URL: %s",
                    CLOSE_DELAY_MS, urlKey.c_str());
         return true;
     }
