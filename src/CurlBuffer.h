@@ -56,6 +56,24 @@ public:
     const std::string& GetOriginalUrl() const { return m_original_kodi_url; }
     void ResetForReuse(); // 延迟关闭复用时重置逻辑状态
 
+    // -----------------------------------------------------------------------
+    // BDMV 元数据 Stat 缓存 (作用域受限: 仅 /BDMV/** 与元数据扩展名。
+    // 只缓存成功探测, 失败一律不缓存 —— 吸取旧全局 Stat 缓存"404 也进缓存"
+    // 的教训。libbluray 菜单导航会对同一批小文件反复 Open→Stat→Read,
+    // 该缓存把重复探测压成零请求。)
+    // -----------------------------------------------------------------------
+    struct StatInfo {
+        int64_t total_size = 0;
+        time_t mod_time = 0;
+        time_t access_time = 0;
+        bool is_directory = false;
+        bool support_range = false;
+    };
+    static bool CachedStatGet(const std::string& url, StatInfo& out);
+    static void CachedStatPut(const std::string& url, const StatInfo& info);
+    static void CachedStatErase(const std::string& url);
+    static void SetMetaCacheTTLSeconds(int seconds); // 0 = 关闭
+
     // 状态控制 (Public allow callback access)
     std::atomic<bool> m_is_running = false;
 

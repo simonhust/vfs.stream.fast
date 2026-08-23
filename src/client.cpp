@@ -179,6 +179,9 @@ kodi::addon::VFSFileHandle CClientVFS::Open(const kodi::addon::VFSUrl &url)
     size_t lru_total_size = (size_t)MyGetSettingInt("lru_total_size", 100) * 1024 * 1024;
     CCurlBuffer::UpdateLRUSettings(lru_block_size, lru_total_size);
 
+    // BDMV 元数据 Stat 缓存 TTL (秒, 0=关闭)
+    CCurlBuffer::SetMetaCacheTTLSeconds(MyGetSettingInt("meta_cache_ttl", 120));
+
     // [New] Fail Fast (Quick Timeout Reconnect)
     bool fail_fast = false;
     if (kodi::addon::CPrivateBase::m_interface && kodi::addon::CPrivateBase::m_interface->toKodi && kodi::addon::CPrivateBase::m_interface->toKodi->kodi_addon) {

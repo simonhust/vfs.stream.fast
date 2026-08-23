@@ -48,6 +48,16 @@
                     <level>0</level>
                     <default>false</default>
                     <control type="toggle" />
+                </setting>
+                <setting id="meta_cache_ttl" type="integer" label="30015">
+                    <level>0</level>
+                    <default>120</default>
+                    <constraints>
+                        <minimum>0</minimum>
+                        <maximum>600</maximum>
+                        <step>10</step>
+                    </constraints>
+                    <control type="slider" format="integer" />
                 </setting>            </group>
         </category>
     </section>

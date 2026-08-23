@@ -162,8 +162,126 @@ void CCurlBuffer::UpdateLRUSettings(size_t block_size, size_t total_size)
 }
 
 // -----------------------------------------------------------------------------------------
-// (Stat 缓存和 Redirect 缓存已移除，跳转地址改为实例变量 m_effective_url)
+// BDMV 元数据 Stat 缓存
+// 作用域受限版(2026-08): 只服务 /BDMV/** 与元数据扩展名, 只缓存成功探测。
+// 旧的全局无差别 Stat 缓存因网盘换源脏读 + 失败结果进缓存(404 bug)被整体移除,
+// 见 commit 1724877; 本实现通过收窄作用域规避同类问题:
+//   - 元数据文件在播放会话内不可变, TTL 内复用安全;
+//   - 普通媒体文件(mp4/mkv/iso/m2ts)不进缓存, 保持每次真实探测。
 // -----------------------------------------------------------------------------------------
+struct MetaStatEntry
+{
+    CCurlBuffer::StatInfo info;
+    std::chrono::steady_clock::time_point fetched_at;
+};
+
+static std::unordered_map<std::string, MetaStatEntry> g_meta_stat_cache;
+static std::mutex g_meta_stat_mutex;
+static unsigned s_meta_cache_ttl_ms = 120 * 1000; // 默认 120s
+
+void CCurlBuffer::SetMetaCacheTTLSeconds(int seconds)
+{
+    if (seconds < 0) seconds = 0;
+    if (seconds > 3600) seconds = 3600;
+    std::lock_guard<std::mutex> lock(g_meta_stat_mutex);
+    s_meta_cache_ttl_ms = (unsigned)seconds * 1000;
+}
+
+bool CCurlBuffer::CachedStatGet(const std::string& url, StatInfo& out)
+{
+    std::lock_guard<std::mutex> lock(g_meta_stat_mutex);
+    auto it = g_meta_stat_cache.find(url);
+    if (it == g_meta_stat_cache.end())
+        return false;
+
+    if (s_meta_cache_ttl_ms == 0 ||
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - it->second.fetched_at).count() >
+            (long long)s_meta_cache_ttl_ms)
+    {
+        g_meta_stat_cache.erase(it); // 过期即删, 顺便防 Map 无限增长
+        return false;
+    }
+
+    out = it->second.info;
+    return true;
+}
+
+void CCurlBuffer::CachedStatPut(const std::string& url, const StatInfo& info)
+{
+    std::lock_guard<std::mutex> lock(g_meta_stat_mutex);
+    if (s_meta_cache_ttl_ms == 0)
+        return;
+    g_meta_stat_cache[url] = {info, std::chrono::steady_clock::now()};
+}
+
+void CCurlBuffer::CachedStatErase(const std::string& url)
+{
+    std::lock_guard<std::mutex> lock(g_meta_stat_mutex);
+    g_meta_stat_cache.erase(url);
+}
+
+// -----------------------------------------------------------------------------------------
+// BDMV 元数据路径判定
+// 命中范围: 路径含 /bdmv/ 段(覆盖 index.bdmv/MovieObject.bdmv/BACKUP/JAR/META 全树),
+//           或扩展名为播放列表/剪辑信息类。这些文件在会话内不变且被 libbluray 高频重开。
+// -----------------------------------------------------------------------------------------
+static bool IsBdmvMetadataUrl(const std::string& url)
+{
+    const size_t query = url.find('?');
+    std::string low = url.substr(0, query == std::string::npos ? url.size() : query);
+    std::transform(low.begin(), low.end(), low.begin(), ::tolower);
+
+    if (low.find("/bdmv/") != std::string::npos)
+        return true;
+
+    size_t dot = low.rfind('.');
+    if (dot == std::string::npos || dot + 1 >= low.size())
+        return false;
+    std::string ext = low.substr(dot + 1);
+    static const char* kMetaExts[] = {"bdmv", "mpls", "clpi", "clpb", "mpl", "ctm"};
+    for (const char* e : kMetaExts)
+        if (ext == e) return true;
+    return false;
+}
+
+// -----------------------------------------------------------------------------------------
+// 元数据单次探测(GET-as-probe)专用回调
+// 与 CacheWriteCallback 的区别: 收满即断(返回0), 防止无视 Range 的服务器
+// 把整个大文件灌下来。truncated 标记用于区分"被熔断"与"自然 EOF"。
+// -----------------------------------------------------------------------------------------
+struct ProbeContext
+{
+    std::vector<uint8_t>* buffer;
+    size_t offset;
+    size_t limit;
+    bool truncated;
+};
+
+static size_t ProbeWriteCallback(void *contents, size_t size, size_t nmemb, void *userp)
+{
+    size_t realsize = size * nmemb;
+    ProbeContext *ctx = (ProbeContext *)userp;
+
+    if (ctx->offset >= ctx->limit)
+    {
+        ctx->truncated = true;
+        return 0; // CURLE_WRITE_ERROR, 主动熔断
+    }
+
+    if (ctx->offset + realsize > ctx->limit)
+    {
+        realsize = ctx->limit - ctx->offset;
+        ctx->truncated = true; // 本轮回填后到达上限
+    }
+
+    if (realsize > 0)
+    {
+        memcpy(ctx->buffer->data() + ctx->offset, contents, realsize);
+        ctx->offset += realsize;
+    }
+    return realsize;
+}
 
 
 // 调试回调：用于打印发送的请求头以及连接信息
@@ -886,6 +1004,141 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     long response_code = 0;
     CURLcode res = CURLE_FAILED_INIT;
 
+    struct curl_slist *headers = NULL;
+    std::string resp_body;
+    char errbuf[CURL_ERROR_SIZE];
+
+    // =========================================================================
+    // BDMV 元数据快速通道 (网盘 BDMV 原盘优化)
+    //   libbluray 菜单导航对 index.bdmv/MovieObject.bdmv/*.mpls/*.clpi 反复
+    //   Open→Stat→Read, 每个小文件 2~3 个请求。此通道将其压缩为:
+    //     缓存命中  → 0 请求
+    //     首次访问  → 1 个 Range GET (代替 HEAD+GET, 数据直入 LRU block#0)
+    //   仅限元数据路径: 普通媒体文件保持真实探测, 规避网盘换源脏读
+    //   (旧全局 Stat 缓存因此被移除, 见 commit 1724877)。
+    // =========================================================================
+    const std::string meta_cache_key = m_file_url; // 已剥离 |options, 含 query
+    const bool is_bdmv_meta = IsBdmvMetadataUrl(m_file_url);
+    bool bdmv_probe_done = false;
+
+    if (is_bdmv_meta && s_meta_cache_ttl_ms > 0)
+    {
+        CCurlBuffer::StatInfo si;
+        if (CCurlBuffer::CachedStatGet(meta_cache_key, si))
+        {
+            m_total_size    = si.total_size;
+            m_mod_time      = si.mod_time;
+            m_access_time   = si.access_time;
+            m_support_range = si.support_range;
+            m_is_directory  = si.is_directory;
+            kodi::Log(ADDON_LOG_INFO,
+                "FastVFS: ★ 元数据Stat缓存命中 (%lld bytes, Range=%d). URL=%s",
+                (long long)m_total_size, m_support_range ? 1 : 0,
+                StripUrlCredentials(m_file_url).c_str());
+            return true;
+        }
+    }
+
+    if (is_bdmv_meta && !m_is_directory)
+    {
+        CURL* probe_curl = GetCurlHandleFromPool();
+        if (probe_curl)
+        {
+            std::string probe_target = !m_effective_url.empty() ? m_effective_url : m_file_url;
+            probe_target = FixDavProtocol(probe_target);
+
+            curl_easy_reset(probe_curl);
+            // 单次 Range GET: bytes=0-(BLOCK-1)。响应头给出真实大小,
+            // 响应体就是 block#0 的内容, 一箭双雕。
+            SetupDownloadRangeOptions(probe_curl, probe_target, 0, LRU_BLOCK_SIZE);
+
+            kodi::Log(ADDON_LOG_DEBUG,
+                "FastVFS: ★ 元数据单次探测 (GET Range 0-%zu). URL=%s",
+                LRU_BLOCK_SIZE - 1, StripUrlCredentials(m_file_url).c_str());
+
+            std::vector<uint8_t> probe_buf(LRU_BLOCK_SIZE);
+            ProbeContext pctx{&probe_buf, 0, probe_buf.size(), false};
+            curl_easy_setopt(probe_curl, CURLOPT_WRITEFUNCTION, ProbeWriteCallback);
+            curl_easy_setopt(probe_curl, CURLOPT_WRITEDATA, &pctx);
+
+            CURLcode pres = curl_easy_perform(probe_curl);
+            long probe_code = 0;
+            curl_easy_getinfo(probe_curl, CURLINFO_RESPONSE_CODE, &probe_code);
+            UpdateEffectiveUrlFromCurl(probe_curl, m_file_url, "MetaProbe");
+
+            // WRITE_ERROR+truncated = 无视 Range 的服务器被我们的回调熔断
+            bool transport_ok = (pres == CURLE_OK) ||
+                                (pres == CURLE_WRITE_ERROR && pctx.truncated);
+
+            if (transport_ok && probe_code == 206 && pctx.offset > 0)
+            {
+                int64_t total = 0;
+                struct curl_header* ph = NULL;
+                if (curl_easy_header(probe_curl, "Content-Range", 0, CURLH_HEADER, -1, &ph) == CURLHE_OK &&
+                    ph && ph->value)
+                {
+                    std::string cr(ph->value);
+                    auto pos = cr.find('/');
+                    if (pos != std::string::npos && pos + 1 < cr.size())
+                    {
+                        std::string total_str = cr.substr(pos + 1);
+                        if (total_str != "*" && !total_str.empty())
+                        {
+                            try { total = std::stoll(total_str); } catch(...) {}
+                        }
+                    }
+                }
+
+                time_t ftime = -1;
+                if (curl_easy_getinfo(probe_curl, CURLINFO_FILETIME, &ftime) == CURLE_OK && ftime > 0)
+                    m_mod_time = (time_t)ftime;
+
+                m_total_size    = (total > 0) ? total : (int64_t)pctx.offset;
+                m_support_range = true;
+                m_is_directory  = false;
+                final_size      = m_total_size;
+                response_code   = 206;
+                res             = CURLE_OK;
+                success         = true;
+
+                // 探测数据直接落入 LRU block#0 —— 后续 Read 直接命中, 零请求
+                {
+                    std::lock_guard<std::mutex> lru_lock(g_lru_cache_mutex);
+                    g_lru_cache.Put(m_file_url, m_mod_time, 0, probe_buf.data(), pctx.offset);
+                }
+
+                CCurlBuffer::StatInfo si;
+                si.total_size = m_total_size;
+                si.mod_time = m_mod_time;
+                si.access_time = 0;
+                si.is_directory = false;
+                si.support_range = true;
+                CCurlBuffer::CachedStatPut(meta_cache_key, si);
+
+                bdmv_probe_done = true;
+                kodi::Log(ADDON_LOG_INFO,
+                    "FastVFS: ★ 元数据单次探测成功 (%lld bytes, 预入 LRU block#0 %zu bytes)",
+                    (long long)m_total_size, pctx.offset);
+            }
+            else
+            {
+                // 失败一律不缓存(吸取旧缓存把失败结果也缓存的教训),
+                // 顺手清掉可能的陈旧项, 然后走常规三级探测
+                CCurlBuffer::CachedStatErase(meta_cache_key);
+                kodi::Log(ADDON_LOG_DEBUG,
+                    "FastVFS: 元数据单次探测未命中 (curl=%d http=%ld), 回退常规 Stat.",
+                    pres, probe_code);
+            }
+            ReturnCurlHandleToPool(probe_curl);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 常规三级探测: WebDAV (PROPFIND) / HTTP (HEAD) / GET fallback
+    // (BDMV 元数据已由上方快速通道处理; 内部缩进保持原样以减小 diff)
+    // -----------------------------------------------------------------------
+    if (!bdmv_probe_done)
+    {
     CURL* curl = GetCurlHandleFromPool();
     if (!curl) return false;
     
@@ -904,10 +1157,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     // =========================================================================
     // 策略分支: WebDAV (PROPFIND) vs HTTP (HEAD)
     // =========================================================================
-    
-    struct curl_slist *headers = NULL;
-    std::string resp_body;
-    char errbuf[CURL_ERROR_SIZE];
+    // (headers/resp_body/errbuf 已上移到元数据快速通道之前声明)
 
     {
         curl_easy_reset(curl);
@@ -1085,8 +1335,10 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         
         // 对 .bdmv, .IFO, .BDM 等蓝光结构及图片文件，不做 fallback
         // 这些通常确实是小文件 且大多是kodi在频繁的扫文件夹，如果使用get，会穿透webdav缓存，直接访问源服务器，导致账号被风控
-        std::string check_ext = GetFileExtensionFromUrl(m_file_url); 
-        bool is_sensitive_file = (check_ext == "bdmv" || check_ext == "ifo" || check_ext == "bdm" || 
+        std::string check_ext = GetFileExtensionFromUrl(m_file_url);
+        bool is_sensitive_file = (check_ext == "bdmv" || check_ext == "ifo" || check_ext == "bdm" ||
+                                check_ext == "mpls" || check_ext == "clpi" || check_ext == "clpb" ||
+                                check_ext == "jar" || IsBdmvMetadataUrl(m_file_url) ||
                                 check_ext == "jpg" || check_ext == "png" || check_ext == "tbn");
 
         // 检测 Emby-Next-Gen 图片占位响应 (Server: Emby-Next-Gen + Content-Type: image/unknown)
@@ -1227,7 +1479,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
                     }
                 }
         } // End of else (HTTP/HTTPS block)
-    
 
     // ---------------------------------------------------------
     // 更新实例跳转地址 (如果发生了跳转)
@@ -1236,6 +1487,9 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
     {
         UpdateEffectiveUrlFromCurl(curl, m_file_url, "Stat");
     }
+
+    ReturnCurlHandleToPool(curl);
+    } // end of !bdmv_probe_done (常规三级探测)
 
     // ---------------------------------------------------------
     // 3. 处理 Stat 结果
@@ -1257,7 +1511,7 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         }
         
         kodi::Log(ADDON_LOG_DEBUG, "FastVFS: Stat Success (%s). Size: %lld, Range: %d, Time: %lld, IsDir: %d", 
-            isWebDav ? "WebDAV" : "HTTP", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
+            bdmv_probe_done ? "MetaProbe" : "Legacy", final_size, m_support_range, (int64_t)m_mod_time, m_is_directory);
     }
     else
     {
@@ -1276,7 +1530,6 @@ bool CCurlBuffer::Stat(const kodi::addon::VFSUrl &url)
         success = false;
     }
 
-    ReturnCurlHandleToPool(curl);
     return success;
 }
 

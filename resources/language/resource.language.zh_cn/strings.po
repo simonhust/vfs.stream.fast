@@ -32,3 +32,7 @@ msgstr "使用 Kodi 代理设置"
 msgctxt "#30014"
 msgid "Enable HTTP/2"
 msgstr "启用 HTTP/2"
+
+msgctxt "#30015"
+msgid "BDMV Metadata Cache TTL (sec, 0=off)"
+msgstr "BDMV元数据缓存时长 (秒,0=关闭)"
